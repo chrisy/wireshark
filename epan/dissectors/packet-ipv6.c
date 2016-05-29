@@ -46,6 +46,8 @@
 #include <epan/decode_as.h>
 #include <epan/proto_data.h>
 
+#include <wsutil/pint.h>
+
 #include <wiretap/erf.h>
 #include <wsutil/str_util.h>
 #include "packet-ipv6.h"
@@ -287,6 +289,25 @@ static int hf_ipv6_routing_rpl_addr_count       = -1;
 static int hf_ipv6_routing_rpl_addr             = -1;
 static int hf_ipv6_routing_rpl_fulladdr         = -1;
 
+static int hf_ipv6_routing_srh_firstseg         = -1;
+static int hf_ipv6_routing_srh_flags            = -1;
+static int hf_ipv6_routing_srh_flag_c           = -1;
+static int hf_ipv6_routing_srh_flag_p           = -1;
+static int hf_ipv6_routing_srh_flag_o           = -1;
+static int hf_ipv6_routing_srh_flag_a           = -1;
+static int hf_ipv6_routing_srh_flag_h           = -1;
+static int hf_ipv6_routing_srh_reserved         = -1;
+static int hf_ipv6_routing_srh_addr             = -1;
+
+static int hf_ipv6_routing_srh_tlv              = -1;
+static int hf_ipv6_routing_srh_tlv_ingress      = -1;
+static int hf_ipv6_routing_srh_tlv_egress       = -1;
+static int hf_ipv6_routing_srh_tlv_opaque       = -1;
+static int hf_ipv6_routing_srh_tlv_padding      = -1;
+static int hf_ipv6_routing_srh_tlv_hmac_key     = -1;
+static int hf_ipv6_routing_srh_tlv_hmac_data    = -1;
+static int hf_ipv6_routing_srh_tlv_unknown      = -1;
+
 static int hf_ipv6_shim6_nxt            = -1;
 static int hf_ipv6_shim6_len            = -1;
 static int hf_ipv6_shim6_p              = -1;
@@ -357,6 +378,7 @@ static gint ett_ipv6_opt_rpl            = -1;
 static gint ett_ipv6_opt_mpl            = -1;
 static gint ett_ipv6_fraghdr            = -1;
 static gint ett_ipv6_routing            = -1;
+static gint ett_ipv6_routing_tlv        = -1;
 static gint ett_ipv6_shim6              = -1;
 static gint ett_ipv6_shim6_option       = -1;
 static gint ett_ipv6_shim6_locators     = -1;
@@ -377,6 +399,13 @@ static gint ett_geoip_info              = -1;
 
 static expert_field ei_ipv6_routing_invalid_length = EI_INIT;
 static expert_field ei_ipv6_routing_invalid_segleft = EI_INIT;
+static expert_field ei_ipv6_routing_srh_invalid_firstseg = EI_INIT;
+static expert_field ei_ipv6_routing_srh_invalid_padding_length = EI_INIT;
+static expert_field ei_ipv6_routing_srh_invalid_padding_redundant = EI_INIT;
+static expert_field ei_ipv6_routing_srh_invalid_padding_alignment = EI_INIT;
+static expert_field ei_ipv6_routing_srh_invalid_hmac_flag = EI_INIT;
+static expert_field ei_ipv6_routing_srh_invalid_hmac_missing_flag = EI_INIT;
+static expert_field ei_ipv6_routing_srh_invalid_hmac_location = EI_INIT;
 static expert_field ei_ipv6_dst_addr_not_multicast = EI_INIT;
 static expert_field ei_ipv6_src_route_list_mult_inst_same_addr = EI_INIT;
 static expert_field ei_ipv6_src_route_list_src_addr = EI_INIT;
@@ -762,7 +791,8 @@ enum {
     IPv6_RT_HEADER_SOURCE_ROUTING=0,
     IPv6_RT_HEADER_NIMROD,
     IPv6_RT_HEADER_MobileIP,
-    IPv6_RT_HEADER_RPL
+    IPv6_RT_HEADER_RPL,
+    IPv6_RT_HEADER_SRH
 };
 
 /* Routing Header Types */
@@ -771,6 +801,17 @@ static const value_string routing_header_type[] = {
     { IPv6_RT_HEADER_NIMROD, "Nimrod" },
     { IPv6_RT_HEADER_MobileIP, "Mobile IP" },
     { IPv6_RT_HEADER_RPL, "RPL" },
+    { IPv6_RT_HEADER_SRH, "Segment Routing Header" },
+    { 0, NULL }
+};
+
+/* Routing Header Type 4 TLV types */
+static const value_string routing_header_tlv[] = {
+    { IP6R4_TLV_INGRESS_NODE, "Ingress Node" },
+    { IP6R4_TLV_EGRESS_NODE, "Egress Node" },
+    { IP6R4_TLV_OPAQUE_CONTAINER, "Opaque Container" },
+    { IP6R4_TLV_PADDING, "Padding" },
+    { IP6R4_TLV_HMAC,  "HMAC" },
     { 0, NULL }
 };
 
@@ -1017,6 +1058,184 @@ dissect_routing6(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data
                 }
                 dst_addr = addr;
             }
+        }
+    }
+
+    /* Segment Routing Header */
+    else if (rt.ip6r_type == IPv6_RT_HEADER_SRH) {
+        struct ip6_rthdr4 rt4;
+        address tlv_addr;
+        struct e_in6_addr tmp_addr;
+        int first_addr, idx;
+        proto_item *ti_flags;
+        int valid = 1;
+
+        static const int * srh_flags[] = {
+              &hf_ipv6_routing_srh_flag_c,
+              &hf_ipv6_routing_srh_flag_p,
+              &hf_ipv6_routing_srh_flag_o,
+              &hf_ipv6_routing_srh_flag_a,
+              &hf_ipv6_routing_srh_flag_h,
+              NULL
+        };
+
+        /* this is bigger than the other "rt" - so need to make our
+         * own copy of the header */
+        tvb_memcpy(tvb, (guint8 *)&rt4, 0, sizeof(rt4));
+
+        if (rt4.ip6r4_len % 2 != 0) {
+            expert_add_info_format(pinfo, ti_len, &ei_ipv6_routing_invalid_length,
+                "IPv6 Routing Header extension header length must not be odd");
+            valid = 0;
+        }
+
+        ti = proto_tree_add_item(rthdr_tree, hf_ipv6_routing_srh_firstseg, tvb, offset, 1, ENC_NA);
+        offset += 1;
+
+        if (rt4.ip6r4_segleft > rt4.ip6r4_firstseg) {
+            expert_add_info_format(pinfo, ti, &ei_ipv6_routing_srh_invalid_firstseg,
+                "IPv6 Segment Routing Header field Segments Left (value=%u) must not "
+                "be greater than the First Segment index (value=%u)",
+            rt4.ip6r4_segleft, rt4.ip6r4_firstseg);
+        }
+
+        ti_flags = proto_tree_add_bitmask(rthdr_tree, tvb, offset, hf_ipv6_routing_srh_flags,
+                               ett_ipv6_routing, srh_flags, ENC_BIG_ENDIAN);
+        offset += 2;
+
+        proto_tree_add_item(rthdr_tree, hf_ipv6_routing_srh_reserved, tvb, offset, 1, ENC_NA);
+        offset += 1;
+
+        if (valid) {
+            int found_hmac = 0;
+
+            /* first entry on list is last segment, aka, ultimate dest */
+            first_addr = offset;
+
+            for (idx = 0; idx <= rt4.ip6r4_firstseg && offset < (int)len;
+                    idx ++, offset += IPv6_ADDR_SIZE) {
+                ti = proto_tree_add_item(rthdr_tree, hf_ipv6_routing_srh_addr, tvb,
+                                    offset, IPv6_ADDR_SIZE, ENC_NA);
+
+                if (idx == 0) {
+                    proto_item_append_text(ti, " (dst)");
+                }
+
+                if (idx == rt4.ip6r4_segleft) {
+                    proto_item_append_text(ti, " (next)");
+
+                    /* append the current dst to the info field */
+                    tvb_get_ipv6(tvb, offset, &tmp_addr);
+                    set_address(&tlv_addr, AT_IPv6, 16, tmp_addr.bytes);
+                    col_add_fstr(pinfo->cinfo, COL_INFO, "(SRv6 via %s) ",
+                        address_with_resolution_to_str(wmem_packet_scope(), &tlv_addr));
+                    col_set_fence(pinfo->cinfo, COL_INFO);
+                }
+
+                tvb_get_ipv6(tvb, offset, addr);
+                if (in6_is_addr_multicast(addr) && idx) { /* first entry can be a multicast addr */
+                    expert_add_info(pinfo, ti, &ei_ipv6_src_route_list_multicast_addr);
+                }
+            }
+
+            /* Anything else left in the header is TLV data */
+            while (offset < (int)len) {
+                struct ip6_rthdr4_tlv tlv;
+                proto_tree *tlv_tree;
+
+                tvb_memcpy(tvb, (guint8 *)&tlv, offset, sizeof(tlv));
+
+                ti = proto_tree_add_item(rthdr_tree, hf_ipv6_routing_srh_tlv, tvb,
+                                    offset + 0, 1, ENC_NA);
+                proto_item_append_text(ti, ", Type %s",
+                                       val_to_str(tlv.ip6r4_tlv_type, routing_header_tlv,
+                                                  "Unknown"));
+
+                tlv_tree = proto_item_add_subtree(ti, ett_ipv6_routing_tlv);
+
+                switch (tlv.ip6r4_tlv_type) {
+                case IP6R4_TLV_INGRESS_NODE:
+                    tvb_get_ipv6(tvb, offset + 4, addr);
+                    set_address(&tlv_addr, AT_IPv6, 16, tmp_addr.bytes);
+                    proto_item_append_text(ti, ", Address %s",
+                        address_with_resolution_to_str(wmem_packet_scope(), &tlv_addr));
+
+                    ti = proto_tree_add_item(tlv_tree, hf_ipv6_routing_srh_tlv_ingress, tvb,
+                                        offset + 4, IPv6_ADDR_SIZE, ENC_NA);
+                    break;
+
+                case IP6R4_TLV_EGRESS_NODE:
+                    tvb_get_ipv6(tvb, offset + 4, addr);
+                    set_address(&tlv_addr, AT_IPv6, 16, tmp_addr.bytes);
+                    proto_item_append_text(ti, ", Address %s",
+                        address_with_resolution_to_str(wmem_packet_scope(), &tlv_addr));
+
+                    ti = proto_tree_add_item(tlv_tree, hf_ipv6_routing_srh_tlv_egress, tvb,
+                                        offset + 4, IPv6_ADDR_SIZE, ENC_NA);
+                    break;
+
+                case IP6R4_TLV_OPAQUE_CONTAINER:
+                    ti = proto_tree_add_item(tlv_tree, hf_ipv6_routing_srh_tlv_opaque, tvb,
+                                        offset + 2, tlv.ip6r4_tlv_len, ENC_NA);
+                    break;
+
+                case IP6R4_TLV_PADDING:
+                    ti = proto_tree_add_item(tlv_tree, hf_ipv6_routing_srh_tlv_padding, tvb,
+                                        offset + 2, tlv.ip6r4_tlv_len, ENC_NA);
+                    /* verify the padding is a valid length */
+                    if (tlv.ip6r4_tlv_len < 1 || tlv.ip6r4_tlv_len > 7) {
+                        expert_add_info(pinfo, ti, &ei_ipv6_routing_srh_invalid_padding_length);
+                    }
+                    /* verify the padding results in correct alignment */
+                    if (!(offset % 8)) {
+                        expert_add_info(pinfo, ti, &ei_ipv6_routing_srh_invalid_padding_redundant);
+                    }
+                    if ((offset + tlv.ip6r4_tlv_len + 2) % 8) {
+                        int v = offset + 2;
+                        v = 8 - (v % 8);
+                        if (v >= 1 && v <= 7)
+                            expert_add_info_format(pinfo, ti, &ei_ipv6_routing_srh_invalid_padding_alignment,
+                                "IPv6 SRH padding must result in an 8-octet alignment (TLV length should be %d)", v);
+                        else /* if our result doesn't meet spec, don't suggest it! */
+                            expert_add_info(pinfo, ti, &ei_ipv6_routing_srh_invalid_padding_alignment);
+                    }
+
+                    break;
+
+                case IP6R4_TLV_HMAC:
+                    ti = proto_tree_add_item(tlv_tree, hf_ipv6_routing_srh_tlv_hmac_key, tvb,
+                                        offset + 4, 4, ENC_NA);
+                    ti = proto_tree_add_item(tlv_tree, hf_ipv6_routing_srh_tlv_hmac_data, tvb,
+                                        offset + 8, 32, ENC_NA);
+                    found_hmac = 1;
+                    /* verify the hmac is in the correct location and properly aligned */
+                    if ((int)offset + 40 != (int)len || offset % 8 != 0) {
+                        expert_add_info(pinfo, ti, &ei_ipv6_routing_srh_invalid_hmac_location);
+                    }
+                    break;
+
+                default:
+                    ti = proto_tree_add_item(tlv_tree, hf_ipv6_routing_srh_tlv_unknown, tvb,
+                                        offset + 2, tlv.ip6r4_tlv_len, ENC_NA);
+                    break;
+                }
+
+                offset += tlv.ip6r4_tlv_len + 2;
+            }
+
+            if (pntoh16(&rt4.ip6r4_flags) & IP6R4_HMAC) {
+                if (!found_hmac)
+                    /* if we didn't find a hmac, check it also was not in the flags */
+                    expert_add_info(pinfo, ti_flags, &ei_ipv6_routing_srh_invalid_hmac_flag);
+            } else {
+                if (found_hmac)
+                    /* an hmac was found but there was no flag saying so */
+                    expert_add_info(pinfo, ti_flags, &ei_ipv6_routing_srh_invalid_hmac_missing_flag);
+            }
+
+            /* copy address at first_addr into addr */
+            tvb_get_ipv6(tvb, first_addr, addr);
+            dst_addr = addr;
         }
     }
 
@@ -3062,6 +3281,97 @@ proto_register_ipv6(void)
                 FT_IPv6, BASE_NONE, NULL, 0,
                 "Uncompressed IPv6 Address", HFILL }
         },
+
+        /* Segment Routing Header */
+        { &hf_ipv6_routing_srh_firstseg,
+            { "First Segment", "ipv6.routing.srh.firstseg",
+                FT_UINT8, BASE_DEC, NULL, 0x0,
+                "Index of the first segment in the address list. "
+                "The list is in reverse order, so this points to the "
+                "last entry on the list.", HFILL }
+        },
+        { &hf_ipv6_routing_srh_flags,
+            { "Flags", "ipv6.routing.srh.flags",
+                FT_UINT16, BASE_HEX, NULL, 0x0,
+                "Segment Routing Flags", HFILL }
+        },
+        { &hf_ipv6_routing_srh_flag_c,
+            { "Clean", "ipv6.routing.srh.flag.c",
+                FT_BOOLEAN, 16, NULL, IP6R4_CLEANUP,
+                "Segment Routing egress node must remove SR header", HFILL }
+        },
+        { &hf_ipv6_routing_srh_flag_p,
+            { "Protected", "ipv6.routing.srh.flag.p",
+                FT_BOOLEAN, 16, NULL, IP6R4_PROTECTED,
+                "Packet has been fast-re-routed", HFILL }
+        },
+        { &hf_ipv6_routing_srh_flag_o,
+            { "OAM", "ipv6.routing.srh.flag.o",
+                FT_BOOLEAN, 16, NULL, IP6R4_OAM,
+                "This is an OAM packet", HFILL }
+        },
+        { &hf_ipv6_routing_srh_flag_a,
+            { "Alert", "ipv6.routing.srh.flag.a",
+                FT_BOOLEAN, 16, NULL, IP6R4_ALERT,
+                "Important TLV objects are present", HFILL }
+        },
+        { &hf_ipv6_routing_srh_flag_h,
+            { "HMAC", "ipv6.routing.srh.flag.h",
+                FT_BOOLEAN, 16, NULL, IP6R4_HMAC,
+                "Security HMAC TLV is present", HFILL }
+        },
+        { &hf_ipv6_routing_srh_reserved,
+            { "Reserved", "ipv6.routing.srh.reserved",
+                FT_BYTES, BASE_NONE, NULL, 0x0,
+                "Must be zero", HFILL }
+        },
+        { &hf_ipv6_routing_srh_addr,
+            { "Segment", "ipv6.routing.srh.addr",
+                FT_IPv6, BASE_NONE, NULL, 0x0,
+                "Segment Address", HFILL }
+        },
+
+        /* Segment Routing Header TLVs */
+        { &hf_ipv6_routing_srh_tlv,
+            { "TLV", "ipv6.routing.srh.tlv",
+                FT_UINT8, BASE_DEC, NULL, 0x0,
+                "TLV data", HFILL }
+        },
+        { &hf_ipv6_routing_srh_tlv_ingress,
+            { "Ingress Node", "ipv6.routing.srh.tlv.ingress",
+                FT_IPv6, BASE_NONE, NULL, 0x0,
+                "Node at which packet entered Segment Routing domain", HFILL }
+        },
+        { &hf_ipv6_routing_srh_tlv_egress,
+            { "Egress Node", "ipv6.routing.srh.tlv.egress",
+                FT_IPv6, BASE_NONE, NULL, 0x0,
+                "Node at which packet expected to exit Segment Routing domain", HFILL }
+        },
+        { &hf_ipv6_routing_srh_tlv_opaque,
+            { "Opaque Container", "ipv6.routing.srh.tlv.opaque",
+                FT_BYTES, SEP_SPACE, NULL, 0x0,
+                "Opaque Data carried with the packet", HFILL }
+        },
+        { &hf_ipv6_routing_srh_tlv_padding,
+            { "Padding", "ipv6.routing.srh.tlv.padding",
+                FT_BYTES, SEP_SPACE, NULL, 0x0,
+                "Padding TLV to ensure the HMAC which follows is aligned on an 8-octet boundary", HFILL }
+        },
+        { &hf_ipv6_routing_srh_tlv_hmac_key,
+            { "HMAC Key", "ipv6.routing.srh.tlv.hmac.key",
+                FT_BYTES, SEP_SPACE, NULL, 0x0,
+                "HMAC security key", HFILL }
+        },
+        { &hf_ipv6_routing_srh_tlv_hmac_data,
+            { "HMAC Data", "ipv6.routing.srh.tlv.hmac.data",
+                FT_BYTES, SEP_SPACE, NULL, 0x0,
+                "HMAC security data", HFILL }
+        },
+        { &hf_ipv6_routing_srh_tlv_unknown,
+            { "Unknown", "ipv6.routing.srh.tlv.unknown",
+                FT_BYTES, SEP_SPACE, NULL, 0x0,
+                "Unknown TLV", HFILL }
+        },
     };
 
     static hf_register_info hf_ipv6_fraghdr[] = {
@@ -3310,6 +3620,7 @@ proto_register_ipv6(void)
         &ett_ipv6_opt_mpl,
         &ett_ipv6_fraghdr,
         &ett_ipv6_routing,
+        &ett_ipv6_routing_tlv,
         &ett_ipv6_shim6,
         &ett_ipv6_shim6_option,
         &ett_ipv6_shim6_locators,
@@ -3436,6 +3747,35 @@ proto_register_ipv6(void)
         { &ei_ipv6_routing_invalid_segleft,
             { "ipv6.routing.invalid_segleft", PI_PROTOCOL, PI_ERROR,
                 "IPv6 Routing Header segments left field must not exceed address count", EXPFILL }
+        },
+        { &ei_ipv6_routing_srh_invalid_firstseg,
+            { "ipv6.routing.srh.invalid_firstseg", PI_PROTOCOL, PI_ERROR,
+                "IPv6 SRH segments left field must not be greater than the first segment index", EXPFILL }
+        },
+        { &ei_ipv6_routing_srh_invalid_padding_length,
+            { "ipv6.routing.srh.invalid_padding_length", PI_PROTOCOL, PI_WARN,
+                "IPv6 SRH padding TLV must have a length from 1 to 7", EXPFILL }
+        },
+        { &ei_ipv6_routing_srh_invalid_padding_redundant,
+            { "ipv6.routing.srh.invalid_padding_redundant", PI_PROTOCOL, PI_WARN,
+                "IPv6 SRH padding TLV is redundant since TLV was already 8-octet aligned", EXPFILL }
+        },
+        { &ei_ipv6_routing_srh_invalid_padding_alignment,
+            { "ipv6.routing.srh.invalid_padding_alignment", PI_PROTOCOL, PI_WARN,
+                "IPv6 SRH padding must result in an 8-octet alignment", EXPFILL }
+        },
+        { &ei_ipv6_routing_srh_invalid_hmac_flag,
+            { "ipv6.routing.srh.invalid_hmac_flag", PI_PROTOCOL, PI_ERROR,
+                "IPv6 SRH flags indicate presence of an HMAC TLV but no HMAC TLV was found", EXPFILL }
+        },
+        { &ei_ipv6_routing_srh_invalid_hmac_missing_flag,
+            { "ipv6.routing.srh.invalid_hmac_missing_flag", PI_PROTOCOL, PI_WARN,
+                "IPv6 SRH HMAC TLV present but HMAC flag is missing", EXPFILL }
+        },
+        { &ei_ipv6_routing_srh_invalid_hmac_location,
+            { "ipv6.routing.srh.invalid_hmac_location", PI_PROTOCOL, PI_ERROR,
+                "IPv6 SRH HMAC is present but either not aligned correctly or not at "
+                "the end of the Segment Routing Header", EXPFILL }
         },
     };
 

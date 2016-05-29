@@ -97,6 +97,41 @@ struct ip6_rthdr0 {
     struct e_in6_addr ip6r0_addr[1];
 };
 
+/* Type 4 Routing header */
+struct ip6_rthdr4 {
+    guint8 ip6r4_nxt;       /* next header */
+    guint8 ip6r4_len;       /* length in units of 8 octets */
+    guint8 ip6r4_type;      /* always zero */
+    guint8 ip6r4_segleft;   /* segments left */
+    guint8 ip6r4_firstseg;  /* first segment */
+    guint16 ip6r4_flags;    /* flags */
+    guint8 ip6r4_reserved;  /* first segment */
+    struct e_in6_addr ip6r4_addr[1]; /* segments */
+};
+
+#define IP6R4_CLEANUP   0x8000  /* clean-up at last hop */
+#define IP6R4_PROTECTED 0x4000  /* fast-rerouted packet */
+#define IP6R4_OAM       0x2000  /* OAM packet */
+#define IP6R4_ALERT     0x1000  /* Important TLV's present */
+#define IP6R4_HMAC      0x0800  /* HMAC TLV is present */
+
+/* Type 4 Routing header TLV section */
+struct ip6_rthdr4_tlv {
+    guint8 ip6r4_tlv_type;  /* type */
+    guint8 ip6r4_tlv_len;   /* length */
+    guint8 ip6r4_tlv_data[1]; /* value */
+};
+
+/* Type 4 Routingh header TLV types */
+enum ip6r4_tlv_types {
+    IP6R4_TLV_UNDEFINED = 0,    /* not defined */
+    IP6R4_TLV_INGRESS_NODE,     /* SR zone ingress node */
+    IP6R4_TLV_EGRESS_NODE,      /* expected SR zone egress node */
+    IP6R4_TLV_OPAQUE_CONTAINER, /* opaque data */
+    IP6R4_TLV_PADDING,          /* padding */
+    IP6R4_TLV_HMAC,             /* HMAC data */
+};
+
 /* Fragment header */
 struct ip6_frag {
     guint8  ip6f_nxt;       /* next header */
